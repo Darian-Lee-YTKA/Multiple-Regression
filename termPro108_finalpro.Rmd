@@ -1,0 +1,789 @@
+---
+title: "Predicting of life expectancy"
+output: html_document
+date: "2023-12-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r lists}
+library("car") # we will need this later on for vif 
+countries_temp = read.csv("/Users/darianlee/Downloads/countries.csv")
+countries_temp_no_nans = countries_temp[complete.cases(countries_temp), ] # get rid of rows with NAs
+set.seed(6037) # a seed I don't think anyone else is gonna choose. The 787th prime number
+n = nrow(countries_temp) # to ensure its 80% of the original and not the nan version
+random_indices = sample(1:n, size = 0.8 * n) # taking our random sample of indices
+countries = countries_temp_no_nans[random_indices, ]
+countries$Indexes = random_indices # residual plot labels points of interest by their indexes in the superset model, which are out of order in our random subset. Having these numbers in a column that I can easily search through (the 0th column is not easily iterable) makes finding these points and analysizing them much easier 
+
+
+# we will use this function when preparing our residual plots for each of the individual predictors vs life expenctancy to ensure that our plots are zoomed in on the bulk of the data 
+remove_outliers = function(data, y) {
+  print(length(data) == length(y))
+  q = quantile(data, c(0.25, 0.75), na.rm = TRUE)
+  iqr = q[2] - q[1]
+  lower_limit = q[1] - 1.5 * iqr
+  upper_limit = q[2] + 1.5 * iqr
+  indices_no_outliers <- which(data >= lower_limit & data <= upper_limit)
+  data_no_outliers = data[indices_no_outliers]
+  y_matching_indexes = y[indices_no_outliers]
+  return(list(data_no_outliers = data_no_outliers, y_no_outliers = y_matching_indexes))
+}
+
+# this function lets us retire the numeric columns so that we can loop through only these columns when making our graphs  
+get_numeric = function(numeric_cols){
+for (name in colnames(countries)){
+    data_temp = countries[, name]
+    if (is.numeric(data_temp)) {
+      numeric_cols = c(numeric_cols, name)
+    }
+  }
+  
+  return (numeric_cols)
+}
+
+empty_vector = c()
+numerics = get_numeric(empty_vector)
+
+# gives us all the numeric columns in countries 
+countries_numeric = countries[numerics]
+
+# this will help us visualize the correlation between each predictor and LifeExpectancy as well as between each predictor and each other 
+correlation_matrix = cor(countries_numeric)
+
+
+heatmap(
+  correlation_matrix,
+  main = "Correlation Heatmap",
+  xlab = "Variables",
+  ylab = "Variables",
+  col = colorRampPalette(c("blue", "white", "red"))(100),
+  symm = TRUE,
+  scale = "none",
+  margins = c(5, 5),
+  cexRow = 0.8,
+  cexCol = 0.8
+)
+
+
+# we ignore the indexes column. This is just to help us later because the residual plot points out points by their indexes, and having them in a column that I can easily search through (the 0th column is not easily iteratable) makes analysis much easier
+```
+```{r}
+print(correlation_matrix)
+```
+
+from this correlation matrix, life expectancy seems most heavily correlated with birthrate and cell. Birthrate seems to have high correlation with elderly pop and cell as well, which could be a potential issue. Elderly pop in particular has a higher correlation with birthrate than it does with life expectancy, which is concerning
+
+```{r setup_graphs}
+# preparing the plots 
+goal_temp = countries$LifeExpectancy
+countries_numeric_X = countries_numeric[, -which(names(countries_numeric) == "LifeExpectancy")]
+
+
+get_plots = function(countries_numeric, goal_temp) {
+  CIs = list()
+  five_num = list()
+  
+# I am going to output them in a pdf file because I think it is useful to have large plots, but I also don't want it to muddy the code. I will attach this pdf in the appendix
+  pdf("single_regression.pdf", width = 16, height = 12) # putting all the graphs into a pdf so that it doesnt muddy the code
+
+  for (name in colnames(countries_numeric)) {
+    if (!(name == "Indexes")){ # no need to make a plot of the indexes 
+      
+    
+    data_temp = countries_numeric[, name]
+    five_num[[name]] = fivenum(data_temp)
+    
+    data_goal_vector = remove_outliers(data_temp, goal_temp)
+
+    data = data_goal_vector$data_no_outliers
+    goal = data_goal_vector$y_no_outliers
+    par(fmrow= c(4,4))
+    scatter = plot(x = data, y = goal,
+                   main = paste("Scatter Plot of", name, "vs. LifeExpectancy"))
+
+    
+    lm_temp = lm(goal ~ data)
+    ci = confint(lm_temp)
+    CIs[[name]] = ci["data", ]
+
+    resid = plot(lm_temp, which = 1, 
+                 main = paste("Residuals vs. Fitted for", name))
+    
+
+    qq = plot(lm_temp, which = 2,
+              main = paste("QQ Plot for Residuals of", name))
+    }
+  }
+
+
+
+# the graphs will go to the pdfs, but the CIs and 5 number summaries don't take up much space, so we will show those in R
+output = list("cis" = CIs, "fivenum" = five_num)
+  return(output)
+}
+
+par(fmrow = c(1,1))
+
+```
+
+
+
+```{r}
+results = get_plots(countries_numeric_X, goal_temp)
+five_num = results$fivenum
+CIs = results$cis
+
+#I'm not totally sure why this prints "TRUE", but its not hurting anything
+```
+```{r}
+CIs
+five_num
+```
+population seems like the only one with a possible 0 slope. No numbers in the 5 number summary stand out as obvious errors. Looking at the scatter plots, internet, elderly pop, CO^2, GDP all seem to have non linear relationships in simple regression. Additionally, birthrate seems to have the best model for a single predictor. Thus we will proceed with building the model
+
+```{r}
+library(leaps)
+
+# for now, lets ignore the potentially important fact that Birthrate and elderly pop have high correlation, and then re-assess later based on how our model looks 
+
+predictors = c("LandArea", "Rural", "Population", "Health", "Internet", "BirthRate", "ElderlyPop", "CO2", "GDP", "Cell")
+temp_df = data.frame(
+  LifeExpectancy = countries$LifeExpectancy,
+  LandArea = countries$LandArea,
+  Rural = countries$Rural,
+  Population = countries$Population,
+  Health = countries$Health,
+  Internet = countries$Internet,
+  BirthRate = countries$BirthRate,
+  ElderlyPop = countries$ElderlyPop,
+  CO2 = countries$CO2,
+  GDP = countries$GDP,
+  Cell = countries$Cell
+)
+
+
+
+max_predictors = length(predictors)
+temp_model = regsubsets(LifeExpectancy ~ ., data = temp_df, nbest = 1, nvmax = max_predictors)
+summary_model = summary(temp_model)
+summary_model
+summary_model$rsq
+summary_model$cp
+summary_model$adjr2
+
+top_adjR2 = order(-summary_model$adjr2)[1:4]
+top_Cp = order(summary_model$cp)[1:4]
+top_r2 = order(-summary_model$rsq)[1:4]
+
+top_adjR2
+top_Cp
+top_r2
+
+```
+
+
+
+so far the best looking models are 7 and 8 because they score in the top 4 for all three important categories 
+
+```{r}
+summary_model$rsq[7]
+summary_model$cp[7]
+summary_model$adjr2[7]
+cat("\n\n")
+summary_model$rsq[8]
+summary_model$cp[8]
+summary_model$adjr2[8]
+
+#because the R^2 and adjusted R^2 are very similar, but the Mallows’ Cp for model 7 is very very close to the number of predictors 
+```
+
+
+
+```{r}
+model7 = lm(LifeExpectancy ~ Health + Internet + BirthRate + ElderlyPop + CO2 + GDP + Cell, data = countries_numeric)
+
+model7
+
+
+par(mfrow = c(1, 2))  
+resid1 = plot(model7, which = 1, 
+                 main = paste("Residuals vs. Fitted for model 7"))
+    
+
+qq1 = plot(model7, which = 2,
+              main = paste("QQ Plot for Residuals of model 7"))
+
+
+residuals_1 = resid(model7)
+Q1 = quantile(residuals_1, 0.25)
+Q3 = quantile(residuals_1, 0.75)
+IQR = Q3 - Q1
+
+threshold = 1.5  
+outliers = residuals_1 < (Q1 - threshold * IQR) | residuals_1 > (Q3 + threshold * IQR)
+
+print(residuals_1[outliers])
+summary(model7)
+```
+```{r}
+#there were 3 big outliers on the residual graph. I will analysize these points in case they are measurement errors 
+print(residuals_1[outliers])
+```
+
+
+lets inspect these variables 
+
+```{r}
+# this is where having our indexes column pays off
+
+  
+
+  pdf("scatter_plots_with_highlights.pdf", width = 16, height = 12) # putting all the graphs into a pdf so that it doesnt muddy the code
+
+
+highlight_indices = c(23, 153, 186)
+only_problem_rows = countries[which(countries_numeric$Indexes %in% highlight_indices), ]
+only_problem_rows
+goal = countries_numeric$LifeExpectancy
+for (name in colnames(countries_numeric)) {
+  if (!(name == "Indexes")) {
+    data = countries_numeric[, name]
+    
+    scatter = plot(x = data, y = goal,
+                    main = paste("Scatter Plot of", name, "vs. LifeExpectancy"))
+    
+    problem_x = only_problem_rows[, name]
+    problem_y = only_problem_rows$LifeExpectancy
+    points(x = problem_x, y = problem_y, col = "red", pch = 20)
+  }
+}
+
+# looking at the graph, it looks like these points may be outliers in have a low life expectancy to birthrate ratio, which according to our heat map is one of the strongest correlated columns 
+
+
+# lets see if they really are outliers
+
+  
+
+```
+```{r}
+# judging by the scatter plots, these are countries where the birth rate is low, but the life expectancy is also low. Lets see if there is anything statistically weird about these points by comparing their ratios to the other countries. I also included CO2 and cell because the points also look lower than normal on the scatter plots for these variables   
+
+countries$ratioCell = countries$Cell/countries$LifeExpectancy
+countries$ratioBirth = countries$BirthRate/countries$LifeExpectancy
+countries$ratioCO2 = countries$CO2/countries$LifeExpectancy
+
+# forward orders 
+head(countries[order(countries$ratioCell), ], 5)
+head(countries[order(countries$ratioBirth), ], 5)
+head(countries[order(countries$ratioCO2), ], 5)
+
+# reverse orders
+
+head(countries[order(countries$ratioCell, decreasing = TRUE), ], 5)
+head(countries[order(countries$ratioBirth, decreasing = TRUE), ], 5)
+head(countries[order(countries$ratioCO2, decreasing = TRUE), ], 5)
+```
+none of these points are showing up as clear outliers in any category. Removing these points is not justified 
+
+
+Lets see if there are any outliers in the highly predictive predictors that may be influencing our results
+```{r}
+
+
+# I am going to modify the function from earlier because I don't want it to change the size of the columns 
+
+important_x = countries$BirthRate
+q = quantile(important_x, c(0.25, 0.75), na.rm = TRUE)
+iqr = q[2] - q[1]
+lower_limit = q[1] - 1.5 * iqr
+upper_limit = q[2] + 1.5 * iqr
+
+new_x = c()
+for (x in important_x){
+  if (x < lower_limit | x > upper_limit){
+    print("outlier found!")
+    new_x = c(new_x, NA)
+  }
+  else{
+    new_x = c(new_x, x)
+  }
+}
+
+
+
+
+
+
+important_x = countries$ElderlyPop
+q = quantile(important_x, c(0.25, 0.75), na.rm = TRUE)
+iqr = q[2] - q[1]
+lower_limit = q[1] - 1.5 * iqr
+upper_limit = q[2] + 1.5 * iqr
+
+new_x = c()
+for (x in important_x){
+  if (x < lower_limit | x > upper_limit){
+    print("outlier found!")
+    new_x = c(new_x, NA)
+  }
+  else{
+    new_x = c(new_x, x)
+  }
+}
+
+
+
+
+
+```
+No outliers were found
+
+
+Lets plot the residuals against each predictor, zooming in on the area where the bulk of the data is 
+
+
+```{r}
+
+
+par(mfrow = c(1, 2))  
+predictors = c("Health", "Internet", "BirthRate", "ElderlyPop", "CO2", "GDP", "Cell")
+
+for (predictor in predictors) {  
+  data = countries[[predictor]]
+  q = quantile(data, c(0.25, 0.75), na.rm = TRUE)
+  iqr = q[2] - q[1]
+  lower_limit = q[1] - 1.5 * iqr
+  upper_limit = q[2] + 1.5 * iqr
+  
+  x_limit_min = max(c(min(data), lower_limit))
+  x_limit_max = min(c(max(data), upper_limit))
+  
+  
+  plot(countries[[predictor]], residuals(model7), main = paste("Residuals vs.", predictor),
+       xlab = predictor, ylab = "Residuals", xlim = c(x_limit_min, x_limit_max)) 
+    abline(h = 0, col = "purple")
+    identify(countries[[predictor]], countries$LifeExpectancy, labels = rownames(countries))
+    
+    
+  
+}
+
+
+
+
+par(mfrow = c(1, 1))
+
+
+
+```
+There are no clear non linear relationships in these X variables, expect perhaps in GDP, where there is sligfht U trend in the residuals. We will try transforming this variable to see if it will improve our overall model. 
+ 
+
+```{r}
+countries$GDP_log = log(countries$GDP)
+```
+
+```{r}
+model7_log = lm(LifeExpectancy ~ Health + Internet + BirthRate + ElderlyPop + CO2 + GDP_log + Cell, data = countries)
+
+
+
+print("new summary (log)")
+print(summary(model7_log))
+
+
+
+par(mfrow = c(1, 2))
+
+
+
+resid2 = plot(model7, which = 1, main = "previous model")
+resid3 = plot(model7_log, which = 1, main = "new model")
+
+
+qq2 = plot(model7, which = 2, main = "previous model")
+qq3 = plot(model7_log, which = 2, main = "new model")
+
+par(mfrow = c(1, 1))
+```
+It seems to make the residual plot more centered at 0, but it made the errors slightly less normal
+
+
+```{r}
+# to see the plots larger 
+resid3 = plot(model7_log, which = 1, main = "Residuals vs. Fitted for Model log")
+qq3 = plot(model7_log, which = 2, main = "QQ Plot for Residuals of Model log")
+
+
+```
+
+```{r}
+# lets see each of the predictors plotted against the residuals once again 
+par(mfrow = c(1, 2))  
+predictors = c("Health", "Internet", "BirthRate", "ElderlyPop", "CO2", "GDP_log", "Cell")
+
+for (predictor in predictors) {  
+  data = countries[[predictor]]
+  q = quantile(data, c(0.25, 0.75), na.rm = TRUE)
+  iqr = q[2] - q[1]
+  lower_limit = q[1] - 1.5 * iqr
+  upper_limit = q[2] + 1.5 * iqr
+  
+  x_limit_min = max(c(min(data), lower_limit))
+  x_limit_max = min(c(max(data), upper_limit))
+  
+  
+  plot(countries[[predictor]], residuals(model7_log), main = paste("Residuals vs.", predictor),
+       xlab = predictor, ylab = "Residuals", xlim = c(x_limit_min, x_limit_max)) 
+    abline(h = 0, col = "purple")
+    identify(countries[[predictor]], countries$LifeExpectancy, labels = rownames(countries))
+    
+    
+  
+}
+
+
+
+
+par(mfrow = c(1, 1))
+
+```
+these plots look much better!
+
+But now the data is slightly non normal. Lets see if transforming the y would help
+```{r}
+library(MASS)
+par(mfrow = c(1,1))
+predictor_data = countries[c("Health", "Internet", "BirthRate", "ElderlyPop", "CO2", "GDP_log", "Cell")]
+
+result = boxcox(countries$LifeExpectancy ~ ., data = predictor_data, lambda = seq(-2, 2, by = 0.1))
+```
+our results indicate that a square transformation of y is most appropriate 
+```{r}
+
+countries$LifeExpectancySquared = countries$LifeExpectancy^2
+
+
+model7_ysquared = lm(LifeExpectancySquared ~ Health + Internet + BirthRate + ElderlyPop + CO2 + GDP_log + Cell, data = countries)
+
+
+
+print("new summary (y squared)")
+print(summary(model7_ysquared))
+
+
+
+par(mfrow = c(1, 2))
+
+
+
+resid2 = plot(model7_log, which = 1, main = "previous model")
+resid3 = plot(model7_ysquared, which = 1, main = "new model")
+
+
+qq2 = plot(model7_log, which = 2, main = "previous model")
+qq3 = plot(model7_ysquared, which = 2, main = "new model")
+
+par(mfrow = c(1, 1))
+```
+This model looks a bit better! It has brought some of our big outliers closer to the line in the qq plot. But the errors still look slightly non normal. Lets try box cox again to see if we should transform y a second time 
+
+```{r}
+# first, lets make sure all our predictors are still looking good 
+par(mfrow = c(1, 2))  
+predictors = c("Health", "Internet", "BirthRate", "ElderlyPop", "CO2", "GDP_log", "Cell")
+
+for (predictor in predictors) {  
+  data = countries[[predictor]]
+  q = quantile(data, c(0.25, 0.75), na.rm = TRUE)
+  iqr = q[2] - q[1]
+  lower_limit = q[1] - 1.5 * iqr
+  upper_limit = q[2] + 1.5 * iqr
+  
+  x_limit_min = max(c(min(data), lower_limit))
+  x_limit_max = min(c(max(data), upper_limit))
+  
+  
+  plot(countries[[predictor]], residuals(model7_ysquared), main = paste("Residuals vs.", predictor),
+       xlab = predictor, ylab = "Residuals", xlim = c(x_limit_min, x_limit_max)) 
+    abline(h = 0, col = "purple")
+    identify(countries[[predictor]], countries$LifeExpectancy, labels = rownames(countries))
+    
+    
+  
+}
+
+
+
+
+par(mfrow = c(1, 1))
+```
+Still look good
+
+```{r}
+# lets see if transforming y again will help normalize our errors 
+library(MASS)
+predictor_data = countries[c("Health", "Internet", "BirthRate", "ElderlyPop", "CO2", "GDP_log", "Cell")]
+result = boxcox(countries$LifeExpectancySquared ~ ., data = predictor_data, lambda = seq(-2, 2, by = 0.1))
+```
+it looks like squaring y is the best transformation 
+```{r}
+countries$LifeExpectancy_4 = countries$LifeExpectancySquared^2
+
+
+model7_y4 = lm(LifeExpectancy_4 ~ Health + Internet + BirthRate + ElderlyPop + CO2 + GDP_log + Cell, data = countries)
+
+
+
+print("new summary (y squared)")
+print(summary(model7_y4))
+
+
+
+par(mfrow = c(1, 2))
+
+
+
+resid2 = plot(model7_ysquared, which = 1, main = "y^2")
+resid3 = plot(model7_y4, which = 1, main = "y^4")
+
+
+qq2 = plot(model7_ysquared, which = 2, main = "y^2")
+qq3 = plot(model7_y4, which = 2, main = "y^4")
+
+par(mfrow = c(1, 1))
+```
+The errors look more normal!
+
+```{r}
+par(mfrow = c(1, 2))  
+predictors = c("Health", "Internet", "BirthRate", "ElderlyPop", "CO2", "GDP_log", "Cell")
+
+for (predictor in predictors) {  
+  data = countries[[predictor]]
+  q = quantile(data, c(0.25, 0.75), na.rm = TRUE)
+  iqr = q[2] - q[1]
+  lower_limit = q[1] - 1.5 * iqr
+  upper_limit = q[2] + 1.5 * iqr
+  
+  x_limit_min = max(c(min(data), lower_limit))
+  x_limit_max = min(c(max(data), upper_limit))
+  
+  
+  plot(countries[[predictor]], residuals(model7_y4), main = paste("Residuals vs.", predictor),
+       xlab = predictor, ylab = "Residuals", xlim = c(x_limit_min, x_limit_max)) 
+    abline(h = 0, col = "purple")
+    identify(countries[[predictor]], countries$LifeExpectancy, labels = rownames(countries))
+    
+    
+  
+}
+
+
+
+
+par(mfrow = c(1, 1))
+```
+```{r}
+# lets find mallow_cp
+library("olsrr")
+
+fullmodel = lm(LifeExpectancy_4 ~ GDP_log + BirthRate + LandArea + Population + Rural + Health + Internet + ElderlyPop + CO2 + Cell, data = countries) 
+
+print("mallows CP:")
+ols_mallows_cp(model7_y4, fullmodel)
+print("p+1 = 7 (we are looking for the marlows cp closest to p+1")
+
+
+```
+
+```{r}
+# lets do one final check that this is the best model
+
+library(leaps)
+
+predictors = c("LandArea", "Rural", "Population", "Health", "Internet", "BirthRate", "ElderlyPop", "CO2", "GDP_log", "Cell")
+temp_df = data.frame(
+  LifeExpectancy = countries$LifeExpectancy_4,
+  LandArea = countries$LandArea,
+  Rural = countries$Rural,
+  Population = countries$Population,
+  Health = countries$Health,
+  Internet = countries$Internet,
+  BirthRate = countries$BirthRate,
+  ElderlyPop = countries$ElderlyPop,
+  CO2 = countries$CO2,
+  GDP = countries$GDP_log,
+  Cell = countries$Cell
+)
+
+
+
+max_predictors = length(predictors)
+temp_model = regsubsets(LifeExpectancy ~ ., data = temp_df, nbest = 1, nvmax = max_predictors)
+summary_model = summary(temp_model)
+summary_model
+summary_model$rsq
+summary_model$cp
+summary_model$adjr2
+
+top_adjR2 = order(-summary_model$adjr2)[1:4]
+top_Cp = order(summary_model$cp)[1:4]
+top_r2 = order(-summary_model$rsq)[1:4]
+
+top_adjR2
+top_Cp
+top_r2
+```
+6 7 and 8 look most promising 
+
+```{r}
+summary_model$rsq[6]
+summary_model$cp[6]
+summary_model$adjr2[6]
+cat("\n\n")
+summary_model$rsq[7]
+summary_model$cp[7]
+summary_model$adjr2[7]
+cat("\n\n")
+summary_model$rsq[8]
+summary_model$cp[8]
+summary_model$adjr2[8]
+
+# model 6 looks the best because the R^2 and adjusted R^2 values for all predictors are very similar, but the cp value is a lot lower. Also, model 6 does not include elderly population, which was the predictor we flagged as potentially having too high of multicolinearity with birthrate. Thus our final model will be less influenced by multicolinearity 
+```
+```{r}
+model6 = lm(LifeExpectancy_4 ~ LandArea + Health + Internet + BirthRate + GDP_log + Cell, data = countries)
+
+
+
+
+print(summary(model6))
+
+
+
+par(mfrow = c(1, 2))
+
+
+
+resid2 = plot(model7_y4, which = 1, main = "previous model")
+resid3 = plot(model6, which = 1, main = "new model")
+
+
+qq2 = plot(model7_y4, which = 2, main = "previous model")
+qq3 = plot(model6, which = 2, main = "new model")
+
+par(mfrow = c(1, 1))
+
+print("mallows CP:")
+ols_mallows_cp(model6, fullmodel)
+print("p+1 = 6 (we are looking for the marlows cp closest to p+1")
+
+
+```
+Residuals are centered at 0 with constant error, errors look normal, and our R^2 and adjusted R^2 are higher! this is all very impressive 
+```{r}
+# one last check that our predictors are linear 
+par(mfrow = c(1, 2))  
+predictors = c("LandArea", "Health", "Internet", "BirthRate", "GDP_log", "Cell")
+
+for (predictor in predictors) {  
+  data = countries[[predictor]]
+  q = quantile(data, c(0.25, 0.75), na.rm = TRUE)
+  iqr = q[2] - q[1]
+  lower_limit = q[1] - 1.5 * iqr
+  upper_limit = q[2] + 1.5 * iqr
+  
+  x_limit_min = max(c(min(data), lower_limit))
+  x_limit_max = min(c(max(data), upper_limit))
+  
+  
+  plot(countries[[predictor]], residuals(model6), main = paste("Residuals vs.", predictor),
+       xlab = predictor, ylab = "Residuals", xlim = c(x_limit_min, x_limit_max)) 
+    abline(h = 0, col = "purple")
+    identify(countries[[predictor]], countries$LifeExpectancy_4, labels = rownames(countries))
+    
+    
+  
+}
+
+
+
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+# we will check the colinearity of our final model one last time
+
+countries_final_subset = countries[c("LifeExpectancy_4", "GDP_log", "Cell", "Internet", "BirthRate", "LandArea", "Health")]
+correlation_matrix = cor(countries_final_subset)
+
+
+heatmap(
+  correlation_matrix,
+  main = "Correlation Heatmap",
+  xlab = "Variables",
+  ylab = "Variables",
+  col = colorRampPalette(c("blue", "white", "red"))(100),
+  symm = TRUE,
+  scale = "none",
+  margins = c(5, 5),
+  cexRow = 0.8,
+  cexCol = 0.8
+)
+```
+```{r}
+correlation_matrix
+```
+```{r}
+vif(model6)
+# technically a value greater than 5 is potentially concerning, but this value is very very close to 5. Also, because this is our most important predictor, removing it would likely be very detremental to our model. It is also noted that even our highest value is still very close to 5, and under 5 is considered medium. Assuming that the model is used mostly for predictive purposes, these vif values should not introduce bias into our predictions. Other applications of the model may require these cmulticolinarity values to reassess, but that is outside the scope of this analysis 
+```
+```{r}
+print(min(countries$LifeExpectancy))
+par(mfrow = c(1, 2)) 
+finalmodel = plot(model6, which = 1, main = "final model")
+finalqq = plot(model6, which = 2, main = "final model")
+```
+
+
+# Note: above concludes the process of building the final model. The rest is experimentions into ways to improve multicolinearity, none of which were determined to improve the model 
+
+```{r}
+# lets try removing cell
+
+
+modelnocor = lm(LifeExpectancy_4 ~ LandArea + Health + GDP_log + Internet + BirthRate, data = countries)
+
+print(summary(modelnocor))
+
+
+
+par(mfrow = c(1, 2))
+
+
+
+resid2 = plot(model6, which = 1, main = "previous model")
+resid3 = plot(modelnocor, which = 1, main = "new model")
+
+
+qq2 = plot(model6, which = 2, main = "previous model")
+qq3 = plot(modelnocor, which = 2, main = "new model")
+vif(modelnocor)
+
+model_summary = summary(modelnocor)
+
+print("mallows CP:")
+ols_mallows_cp(modelnocor, fullmodel)
+print("p+1 = 5 (we are looking for the marlows cp closest to p+1")
+```
+All the vif values are less than 5 now, but the errors are less normal now and less centered at 0. I don't think this trade off is worth it. The R^2, adjusted R^2 and marlows CP value are also worse now. Thus I conclude that model6 is the best model
+
+
+
